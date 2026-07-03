@@ -208,11 +208,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    // 🔥 LOG DETALHADO PARA VER A RESPOSTA REAL DA NVIDIA
+    if (error.response) {
+      console.error('NVIDIA NIM Rejeitou com:', error.response.status, JSON.stringify(error.response.data));
+    } else {
+      console.error('Proxy error:', error.message);
+    }
     
     res.status(error.response?.status || 500).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: error.response?.data?.detail || error.message || 'Internal server error',
         type: 'invalid_request_error',
         code: error.response?.status || 500
       }
