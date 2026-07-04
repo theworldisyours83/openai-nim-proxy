@@ -100,7 +100,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Connection': 'close'
       },
       responseType: stream ? 'stream' : 'json'
     });
