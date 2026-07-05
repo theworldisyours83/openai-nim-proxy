@@ -66,37 +66,22 @@ app.get('/v1/models', (req, res) => {
 
 // Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
+  const { model, messages, stream, max_tokens, temperature, top_p } = req.body;
+
+  // Realiza o mapeamento do modelo para o catálogo da NVIDIA NIM
+  const nimModel = MODEL_MAPPING[model] || model;
+
+  const nimRequest = {
+    model: nimModel,
+    messages: messages,
+    max_tokens: max_tokens || 2048,
+    temperature: temperature || 0.6,
+    top_p: top_p || 0.9,
+    stream: stream || false
+  };
+
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
-    
-    // Smart model selection with fallback
-   let nimModel = MODEL_MAPPING[model];
-    
-    if (!nimModel) {
-      const modelLower = model.toLowerCase();
-      if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-        nimModel = 'meta/llama-3.1-405b-instruct';
-      } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-        nimModel = 'meta/llama-3.1-70b-instruct';
-      } else if (model.includes('/') || model.includes('-')) {
-        // Se o usuário já passou o nome real do modelo NIM (ex: "meta/llama-3.3-70b-instruct")
-        nimModel = model;
-      } else {
-        nimModel = 'meta/llama-3.1-8b-instruct';
-      }
-    }
-    
-    // Transform OpenAI request to NIM format
-    const nimRequest = {
-      model: nimModel,
-      messages: messages,
-      temperature: temperature || 0.6,
-      max_tokens: max_tokens || 9024,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
-      stream: stream || false
-    };
-    
-   // Make request to NVIDIA NIM API
+    // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
@@ -189,7 +174,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
     } else {
-      // Handle non-streaming response (Mapeamento padrão síncrono)
+      // Handle non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
