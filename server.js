@@ -96,7 +96,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Make request to NVIDIA NIM API
+   // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
@@ -105,7 +105,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       },
       responseType: stream ? 'stream' : 'json'
     });
-    
+
     if (stream) {
       // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
@@ -113,8 +113,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       let buffer = '';
       let reasoningStarted = false;
-
-      // 🔥 PROTOCOLO DE SEGURANÇA: Se o usuário cancelar a mensagem ou fechar o chat, limpa tudo imediatamente
+      
       req.on('close', () => {
         if (!response.data.destroyed) {
           response.data.destroy();
@@ -180,15 +179,64 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('end', () => {
         res.end();
-        response.data.destroy(); // 🔥 Força a destruição do stream ao terminar
+        response.data.destroy();
       });
       
       response.data.on('error', (err) => {
         console.error('Stream error:', err);
         res.end();
-        response.data.destroy(); // 🔥 Libera memória em caso de erro no meio do caminho
+        response.data.destroy();
       });
+
+    } else {
+      // Handle non-streaming response (Mapeamento padrão síncrono)
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: response.data.choices.map(choice => {
+          let fullContent = choice.message?.content || '';
+          
+          if (SHOW_REASONING && choice.message?.reasoning_content) {
+            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
+          }
+          
+          return {
+            index: choice.index,
+            message: {
+              role: choice.message.role,
+              content: fullContent
+            },
+            finish_reason: choice.finish_reason
+          };
+        }),
+        usage: response.data.usage || {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+      
+      res.json(openaiResponse);
     }
+    
+  } catch (error) {
+    if (error.response) {
+      console.error('NVIDIA NIM Rejeitou com:', error.response.status, JSON.stringify(error.response.data));
+    } else {
+      console.error('Proxy error:', error.message);
+    }
+    
+    res.status(error.response?.status || 500).json({
+      error: {
+        message: error.response?.data?.detail || error.message || 'Internal server error',
+        type: 'invalid_request_error',
+        code: error.response?.status || 500
+      }
+    });
+  }
+});
     
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
