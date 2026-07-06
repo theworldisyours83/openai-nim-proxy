@@ -103,7 +103,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Content-Type': 'application/json',
         'Connection': 'close'
       },
-      responseType: stream ? 'stream' : 'json'
+      responseType: stream ? 'stream' : 'json',
+      timeout: 30000, // 30 segundos de tolerância máxima para a NVIDIA responder
+      validateStatus: function (status) {
+        return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
+      }
     });
     
     if (stream) {
