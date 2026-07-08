@@ -104,7 +104,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Connection': 'close'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 30000, // 30 segundos de tolerância máxima para a NVIDIA responder
+      timeout: 60000, // 1 minuto de tolerância máxima para a NVIDIA responder
       validateStatus: function (status) {
         return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
       }
