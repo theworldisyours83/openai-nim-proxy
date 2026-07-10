@@ -2,33 +2,27 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// Configuração de agentes HTTP/HTTPS para reutilização de conexões TCP.
+// Evita gargalos de portas abertas (TIME_WAIT) e problemas de Gateway.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+
 app.use(cors());
+app.use(express.json({ limit: process.env.JSON_LIMIT || '50mb' }));
+app.use(express.urlencoded({ limit: process.env.JSON_LIMIT || '50mb', extended: true }));
 
-app.use(express.json({
-  limit: process.env.JSON_LIMIT || '50mb'
-}));
-
-app.use(express.urlencoded({
-  limit: process.env.JSON_LIMIT || '50mb',
-  extended: true
-}));
-
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
+const SHOW_REASONING = false;
+const ENABLE_THINKING_MODE = false;
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
-
-// Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'z-ai/glm-5.2',
   'gpt-4': 'qwen/qwen3.5-397b-a17b',
@@ -39,17 +33,15 @@ const MODEL_MAPPING = {
   'gemini-pro': 'stepfun-ai/step-3.7-flash'
 };
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+    service: 'NVIDIA NIM Proxy (Stable)', 
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE
   });
 });
 
-// List models endpoint (OpenAI compatible)
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -57,36 +49,35 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
-  res.json({
-    object: 'list',
-    data: models
-  });
+  res.json({ object: 'list', data: models });
 });
 
-// Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
+  const abortController = new AbortController();
+  let streamClosedByClient = false;
+  
+  req.on('close', () => {
+    streamClosedByClient = true;
+    abortController.abort();
+  });
+
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Smart model selection with fallback
-   let nimModel = MODEL_MAPPING[model];
-    
+    let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
-      const modelLower = model.toLowerCase();
+      const modelLower = (model || '').toLowerCase();
       if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
         nimModel = 'meta/llama-3.1-405b-instruct';
       } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
         nimModel = 'meta/llama-3.1-70b-instruct';
-      } else if (model.includes('/') || model.includes('-')) {
-        // Se o usuário já passou o nome real do modelo NIM (ex: "meta/llama-3.3-70b-instruct")
+      } else if (modelLower.includes('/') || modelLower.includes('-')) {
         nimModel = model;
       } else {
         nimModel = 'meta/llama-3.1-8b-instruct';
       }
     }
     
-    // Transform OpenAI request to NIM format
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -96,45 +87,62 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json',
-        'Connection': 'close'
+        'Content-Type': 'application/json'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 120000, // 2 minutos de tolerância máxima para a NVIDIA responder
-      validateStatus: function (status) {
-        return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
-      }
+      timeout: 120000,
+      httpAgent,
+      httpsAgent,
+      signal: abortController.signal,
+      validateStatus: status => status >= 200 && status < 300
     });
     
     if (stream) {
-      // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // Evita que proxies como Nginx retenham os pacotes
       
       let buffer = '';
       let reasoningStarted = false;
+      let isDoneSent = false;
       
       response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        if (streamClosedByClient) return;
+
+        // Normaliza quebras de linha para evitar falhas em ambientes Windows/Linux mistos
+        buffer += chunk.toString('utf8').replace(/\r\n/g, '\n');
         
-        lines.forEach(line => {
-          if (line.startsWith('data: ')) {
-            if (line.includes('[DONE]')) {
-              res.write(line + '\n');
-              return;
+        // SSE usa dupla quebra de linha como delimitador de evento real
+        const events = buffer.split('\n\n');
+        
+        // O último elemento pode ser um pacote incompleto que chegou pela rede, guardamos no buffer
+        buffer = events.pop() || '';
+        
+        for (const event of events) {
+          const trimmedEvent = event.trim();
+          if (!trimmedEvent) continue;
+
+          if (trimmedEvent.startsWith('data:')) {
+            const dataStr = trimmedEvent.slice(5).trim();
+            
+            if (dataStr === '[DONE]') {
+              if (!isDoneSent) {
+                res.write('data: [DONE]\n\n');
+                isDoneSent = true;
+              }
+              continue;
             }
             
             try {
-              const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
+              const data = JSON.parse(dataStr);
+              if (data.choices && data.choices[0] && data.choices[0].delta) {
+                const delta = data.choices[0].delta;
+                const reasoning = delta.reasoning_content;
+                const content = delta.content;
                 
                 if (SHOW_REASONING) {
                   let combinedContent = '';
@@ -154,33 +162,47 @@ app.post('/v1/chat/completions', async (req, res) => {
                   }
                   
                   if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
+                    delta.content = combinedContent;
                   }
+                  delete delta.reasoning_content;
                 } else {
                   if (content) {
-                    data.choices[0].delta.content = content;
+                    delta.content = content;
                   } else {
-                    data.choices[0].delta.content = '';
+                    delta.content = '';
                   }
-                  delete data.choices[0].delta.reasoning_content;
+                  delete delta.reasoning_content;
                 }
               }
+              // Transmite o JSON formatado e finaliza o bloco com dupla quebra de linha
               res.write(`data: ${JSON.stringify(data)}\n\n`);
+              // Força o envio imediato se o método flush existir no ambiente Node/Express
+              if (res.flush) res.flush();
             } catch (e) {
-              res.write(line + '\n');
+              console.error('Falha temporária de parse JSON ignorada:', e.message);
             }
           }
-        });
+        }
       });
       
-      response.data.on('end', () => res.end());
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
+      response.data.on('end', () => {
+        if (!isDoneSent && !streamClosedByClient) {
+          res.write('data: [DONE]\n\n');
+          isDoneSent = true;
+        }
         res.end();
       });
-   } else {
-      // Transform NIM response to OpenAI format with reasoning
+      
+      response.data.on('error', (err) => {
+        console.error('Erro de rede durante o stream da NVIDIA:', err.message);
+        if (!isDoneSent && !streamClosedByClient) {
+          res.write('data: [DONE]\n\n'); // Força a liberação do cliente mesmo em erro
+          isDoneSent = true;
+        }
+        res.end();
+      });
+      
+    } else {
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -202,49 +224,47 @@ app.post('/v1/chat/completions', async (req, res) => {
             finish_reason: choice.finish_reason
           };
         }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
+        usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       };
-      
       res.json(openaiResponse);
     }
     
   } catch (error) {
-    // 🔥 LOG DETALHADO DA NVIDIA
+    if (axios.isCancel(error)) {
+      return; 
+    }
+
     if (error.response) {
-      console.error('NVIDIA NIM Rejeitou com:', error.response.status, JSON.stringify(error.response.data));
+      console.error('API da NVIDIA retornou erro:', error.response.status, error.response.data);
     } else {
-      console.error('Proxy error:', error.message);
+      console.error('Falha de conexão no Proxy:', error.message);
     }
     
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.response?.data?.detail || error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
-    });
+    if (!res.headersSent) {
+      res.status(error.response?.status || 502).json({
+        error: {
+          message: error.response?.data?.detail || error.message || 'Erro de conexão upstream',
+          type: 'proxy_error',
+          code: error.response?.status || 502
+        }
+      });
+    } else if (!streamClosedByClient) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   }
 });
 
-// Catch-all para rotas não encontradas
 app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
+  res.status(404).json({ error: { message: `Endpoint ${req.path} not found`, type: 'not_found', code: 404 } });
 });
 
-// Inicialização do Servidor
-app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+process.on('uncaughtException', (err) => console.error('Falha Crítica (uncaughtException):', err));
+process.on('unhandledRejection', (reason) => console.error('Falha Crítica (unhandledRejection):', reason));
+
+const server = app.listen(PORT, () => {
+  console.log(`Proxy rodando perfeitamente na porta ${PORT}`);
 });
+
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
