@@ -2,16 +2,9 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const http = require('http');
-const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Configuração de agentes HTTP/HTTPS para manter conexões vivas (Keep-Alive)
-// Isso previne erros de socket e 502 Bad Gateway por exaustão de portas
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 // Middleware
 app.use(cors());
@@ -29,10 +22,10 @@ app.use(express.urlencoded({
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
+// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 
-// THINKING MODE TOGGLE - Enables thinking for specific models that support it
+// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
 
 // Model mapping (adjust based on available NIM models)
@@ -73,27 +66,20 @@ app.get('/v1/models', (req, res) => {
 
 // Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
-  // Cria um AbortController para cancelar a requisição se o cliente desconectar
-  const abortController = new AbortController();
-  
-  // Se o cliente fechar a conexão antecipadamente, abortamos o Axios
-  req.on('close', () => {
-    abortController.abort();
-  });
-
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
     // Smart model selection with fallback
-    let nimModel = MODEL_MAPPING[model];
+   let nimModel = MODEL_MAPPING[model];
     
     if (!nimModel) {
-      const modelLower = (model || '').toLowerCase();
+      const modelLower = model.toLowerCase();
       if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
         nimModel = 'meta/llama-3.1-405b-instruct';
       } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
         nimModel = 'meta/llama-3.1-70b-instruct';
-      } else if (modelLower.includes('/') || modelLower.includes('-')) {
+      } else if (model.includes('/') || model.includes('-')) {
+        // Se o usuário já passou o nome real do modelo NIM (ex: "meta/llama-3.3-70b-instruct")
         nimModel = model;
       } else {
         nimModel = 'meta/llama-3.1-8b-instruct';
@@ -114,22 +100,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Connection': 'close'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 120000,
-      httpAgent,
-      httpsAgent,
-      signal: abortController.signal,
+      timeout: 120000, // 2 minutos de tolerância máxima para a NVIDIA responder
       validateStatus: function (status) {
-        return status >= 200 && status < 300;
+        return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
       }
     });
     
     if (stream) {
+      // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
       
       let buffer = '';
       let reasoningStarted = false;
@@ -137,23 +121,17 @@ app.post('/v1/chat/completions', async (req, res) => {
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
-        
-        // Mantém a última linha no buffer caso ela esteja incompleta
         buffer = lines.pop() || '';
         
         lines.forEach(line => {
-          const trimmedLine = line.trim();
-          if (trimmedLine.startsWith('data: ')) {
-            if (trimmedLine.includes('[DONE]')) {
-              res.write(trimmedLine + '\n\n');
+          if (line.startsWith('data: ')) {
+            if (line.includes('[DONE]')) {
+              res.write(line + '\n');
               return;
             }
             
             try {
-              const dataStr = trimmedLine.slice(6).trim();
-              if (!dataStr) return; // Proteção contra linhas vazias
-              
-              const data = JSON.parse(dataStr);
+              const data = JSON.parse(line.slice(6));
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
@@ -190,25 +168,19 @@ app.post('/v1/chat/completions', async (req, res) => {
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              // Em caso de falha no parse do JSON, ignoramos a linha silenciosamente
-              // ou repassamos de forma bruta para evitar travar o fluxo
+              res.write(line + '\n');
             }
           }
         });
       });
       
       response.data.on('end', () => res.end());
-      
       response.data.on('error', (err) => {
-        console.error('Erro no stream de dados da NVIDIA:', err.message);
-        if (!res.headersSent) {
-          res.status(502).json({ error: { message: 'Stream interrompido', type: 'bad_gateway' } });
-        } else {
-          res.end();
-        }
+        console.error('Stream error:', err);
+        res.end();
       });
-      
-    } else {
+   } else {
+      // Transform NIM response to OpenAI format with reasoning
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -241,27 +213,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    // Se o erro foi causado pelo cliente fechando a conexão (AbortError), apenas ignoramos
-    if (axios.isCancel(error)) {
-      console.log('Requisição cancelada pelo cliente.');
-      return;
-    }
-
+    // 🔥 LOG DETALHADO DA NVIDIA
     if (error.response) {
       console.error('NVIDIA NIM Rejeitou com:', error.response.status, JSON.stringify(error.response.data));
     } else {
-      console.error('Erro de Proxy:', error.message);
+      console.error('Proxy error:', error.message);
     }
     
-    if (!res.headersSent) {
-      res.status(error.response?.status || 502).json({
-        error: {
-          message: error.response?.data?.detail || error.message || 'Erro de conexão ou falha interna do servidor',
-          type: 'invalid_request_error',
-          code: error.response?.status || 502
-        }
-      });
-    }
+    res.status(error.response?.status || 500).json({
+      error: {
+        message: error.response?.data?.detail || error.message || 'Internal server error',
+        type: 'invalid_request_error',
+        code: error.response?.status || 500
+      }
+    });
   }
 });
 
@@ -276,24 +241,10 @@ app.all('*', (req, res) => {
   });
 });
 
-// Proteções globais contra falhas que poderiam parar o servidor
-process.on('uncaughtException', (err) => {
-  console.error('Exceção não tratada capturada globalmente:', err);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Promessa rejeitada não tratada:', reason);
-});
-
 // Inicialização do Servidor
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
 });
-
-// Ajustes essenciais de timeout para evitar erros 502 em balanceadores de carga
-// O timeout do Node deve ser maior que o timeout do proxy reverso (ex: Nginx/AWS)
-server.keepAliveTimeout = 65000; // 65 segundos
-server.headersTimeout = 66000;   // Deve ser um pouco maior que keepAliveTimeout
