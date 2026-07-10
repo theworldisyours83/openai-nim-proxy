@@ -9,7 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Configuração de agentes HTTP/HTTPS para reutilização de conexões TCP.
-// Evita gargalos de portas abertas (TIME_WAIT) e problemas de Gateway.
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
@@ -89,16 +88,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
 
-    // SE FOR STREAM: Preparamos a conexão imediatamente para evitar timeout no Railway
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
-      res.flushHeaders(); // Libera os cabeçalhos IMEDIATAMENTE
+      res.flushHeaders(); 
 
-      // Inicia um "Heartbeat" (Pulso de Vida) para manter a conexão ativa
-      // Envia um comentário SSE a cada 15s enquanto a NVIDIA não responde
       heartbeatInterval = setInterval(() => {
         if (!streamClosedByClient) {
           res.write(': keepalive ping\n\n'); 
@@ -113,14 +109,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Content-Type': 'application/json'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 180000, // Aumentado para 3 minutos de tolerância na NVIDIA
+      timeout: 180000, 
       httpAgent,
       httpsAgent,
       signal: abortController.signal,
       validateStatus: status => status >= 200 && status < 300
     });
     
-    // Se a NVIDIA respondeu, paramos o pulso de vida, pois os dados reais vão fluir
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
       heartbeatInterval = null;
@@ -140,10 +135,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         
         for (const event of events) {
           const trimmedEvent = event.trim();
-          if (!trimmedEvent) continue;
-
-          // Ignora pings que possam vir da própria NVIDIA
-          if (trimmedEvent.startsWith(':')) continue;
+          if (!trimmedEvent || trimmedEvent.startsWith(':')) continue;
 
           if (trimmedEvent.startsWith('data:')) {
             const dataStr = trimmedEvent.slice(5).trim();
@@ -190,7 +182,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               res.write(`data: ${JSON.stringify(data)}\n\n`);
               if (res.flush) res.flush();
             } catch (e) {
-              // Falha silenciosa para pacotes quebrados
+              // Falha silenciosa para pacotes incompletos
             }
           }
         }
@@ -214,7 +206,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
       
     } else {
-      // Processamento sem stream permanece inalterado
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -241,23 +232,41 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (axios.isCancel(error)) return; 
 
+    // Análise detalhada do erro retornado
+    let errorDetail = 'Erro de conexão upstream.';
     if (error.response) {
-      console.error('API da NVIDIA retornou erro:', error.response.status, error.response.data);
+      console.error('API da NVIDIA retornou erro:', error.response.status, JSON.stringify(error.response.data));
+      errorDetail = error.response.data?.detail || error.response.data?.message || `Erro HTTP ${error.response.status} da NVIDIA.`;
     } else {
       console.error('Falha de conexão no Proxy:', error.message);
+      errorDetail = error.message;
     }
     
-    // Tratamento de erro revisado: se os cabeçalhos já foram enviados pelo Heartbeat, não podemos usar res.status()
     if (!res.headersSent) {
+      // Se os cabeçalhos ainda não foram enviados, retornamos o erro HTTP padrão
       res.status(error.response?.status || 502).json({
         error: {
-          message: error.response?.data?.detail || error.message || 'Erro de conexão upstream',
+          message: errorDetail,
           type: 'proxy_error',
           code: error.response?.status || 502
         }
       });
     } else if (!streamClosedByClient) {
-      // Como a conexão já está aberta via stream, encerramos graciosamente
+      // INJEÇÃO DE ERRO NO STREAM:
+      // Transforma o erro real em uma mensagem de chat para que o cliente exiba na tela
+      const errorPayload = {
+        id: `chatcmpl-error-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: 'proxy-error-reporter',
+        choices: [{
+          index: 0,
+          delta: { content: `\n\n**[Erro no Servidor Proxy]** A comunicação com a NVIDIA falhou: ${errorDetail}\n\n` },
+          finish_reason: 'stop'
+        }]
+      };
+      
+      res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     }
