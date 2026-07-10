@@ -55,10 +55,12 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const abortController = new AbortController();
   let streamClosedByClient = false;
+  let heartbeatInterval = null;
   
   req.on('close', () => {
     streamClosedByClient = true;
     abortController.abort();
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
   });
 
   try {
@@ -86,6 +88,24 @@ app.post('/v1/chat/completions', async (req, res) => {
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
+
+    // SE FOR STREAM: Preparamos a conexão imediatamente para evitar timeout no Railway
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders(); // Libera os cabeçalhos IMEDIATAMENTE
+
+      // Inicia um "Heartbeat" (Pulso de Vida) para manter a conexão ativa
+      // Envia um comentário SSE a cada 15s enquanto a NVIDIA não responde
+      heartbeatInterval = setInterval(() => {
+        if (!streamClosedByClient) {
+          res.write(': keepalive ping\n\n'); 
+          if (res.flush) res.flush();
+        }
+      }, 15000);
+    }
     
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
@@ -93,19 +113,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Content-Type': 'application/json'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 120000,
+      timeout: 180000, // Aumentado para 3 minutos de tolerância na NVIDIA
       httpAgent,
       httpsAgent,
       signal: abortController.signal,
       validateStatus: status => status >= 200 && status < 300
     });
     
+    // Se a NVIDIA respondeu, paramos o pulso de vida, pois os dados reais vão fluir
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+    
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // Evita que proxies como Nginx retenham os pacotes
-      
       let buffer = '';
       let reasoningStarted = false;
       let isDoneSent = false;
@@ -113,18 +134,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       response.data.on('data', (chunk) => {
         if (streamClosedByClient) return;
 
-        // Normaliza quebras de linha para evitar falhas em ambientes Windows/Linux mistos
         buffer += chunk.toString('utf8').replace(/\r\n/g, '\n');
-        
-        // SSE usa dupla quebra de linha como delimitador de evento real
         const events = buffer.split('\n\n');
-        
-        // O último elemento pode ser um pacote incompleto que chegou pela rede, guardamos no buffer
         buffer = events.pop() || '';
         
         for (const event of events) {
           const trimmedEvent = event.trim();
           if (!trimmedEvent) continue;
+
+          // Ignora pings que possam vir da própria NVIDIA
+          if (trimmedEvent.startsWith(':')) continue;
 
           if (trimmedEvent.startsWith('data:')) {
             const dataStr = trimmedEvent.slice(5).trim();
@@ -146,7 +165,6 @@ app.post('/v1/chat/completions', async (req, res) => {
                 
                 if (SHOW_REASONING) {
                   let combinedContent = '';
-                  
                   if (reasoning && !reasoningStarted) {
                     combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
@@ -161,25 +179,18 @@ app.post('/v1/chat/completions', async (req, res) => {
                     combinedContent += content;
                   }
                   
-                  if (combinedContent) {
-                    delta.content = combinedContent;
-                  }
+                  if (combinedContent) delta.content = combinedContent;
                   delete delta.reasoning_content;
                 } else {
-                  if (content) {
-                    delta.content = content;
-                  } else {
-                    delta.content = '';
-                  }
+                  if (content) delta.content = content;
+                  else delta.content = '';
                   delete delta.reasoning_content;
                 }
               }
-              // Transmite o JSON formatado e finaliza o bloco com dupla quebra de linha
               res.write(`data: ${JSON.stringify(data)}\n\n`);
-              // Força o envio imediato se o método flush existir no ambiente Node/Express
               if (res.flush) res.flush();
             } catch (e) {
-              console.error('Falha temporária de parse JSON ignorada:', e.message);
+              // Falha silenciosa para pacotes quebrados
             }
           }
         }
@@ -194,15 +205,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
       
       response.data.on('error', (err) => {
-        console.error('Erro de rede durante o stream da NVIDIA:', err.message);
+        console.error('Erro no stream da NVIDIA:', err.message);
         if (!isDoneSent && !streamClosedByClient) {
-          res.write('data: [DONE]\n\n'); // Força a liberação do cliente mesmo em erro
+          res.write('data: [DONE]\n\n');
           isDoneSent = true;
         }
         res.end();
       });
       
     } else {
+      // Processamento sem stream permanece inalterado
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -210,17 +222,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         model: model,
         choices: response.data.choices.map(choice => {
           let fullContent = choice.message?.content || '';
-          
           if (SHOW_REASONING && choice.message?.reasoning_content) {
             fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
-          
           return {
             index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
+            message: { role: choice.message.role, content: fullContent },
             finish_reason: choice.finish_reason
           };
         }),
@@ -230,9 +237,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    if (axios.isCancel(error)) {
-      return; 
-    }
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+
+    if (axios.isCancel(error)) return; 
 
     if (error.response) {
       console.error('API da NVIDIA retornou erro:', error.response.status, error.response.data);
@@ -240,6 +247,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       console.error('Falha de conexão no Proxy:', error.message);
     }
     
+    // Tratamento de erro revisado: se os cabeçalhos já foram enviados pelo Heartbeat, não podemos usar res.status()
     if (!res.headersSent) {
       res.status(error.response?.status || 502).json({
         error: {
@@ -249,6 +257,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       });
     } else if (!streamClosedByClient) {
+      // Como a conexão já está aberta via stream, encerramos graciosamente
       res.write('data: [DONE]\n\n');
       res.end();
     }
