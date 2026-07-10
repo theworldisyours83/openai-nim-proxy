@@ -8,7 +8,6 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuração de agentes HTTP/HTTPS para reutilização de conexões TCP.
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
@@ -32,21 +31,11 @@ const MODEL_MAPPING = {
   'gemini-pro': 'stepfun-ai/step-3.7-flash'
 };
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'NVIDIA NIM Proxy (Stable)', 
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
-  });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
+    id: model, object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy'
   }));
   res.json({ object: 'list', data: models });
 });
@@ -95,9 +84,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders(); 
 
+      // PING CAMUFLADO: Envia um chunk JSON vazio válido. 
+      // Não quebra os parsers da OpenAI e previne o Erro 499 do servidor.
       heartbeatInterval = setInterval(() => {
         if (!streamClosedByClient) {
-          res.write(': keepalive ping\n\n'); 
+          const fakeChunk = {
+            id: `chatcmpl-ping-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: nimModel,
+            choices: [{ index: 0, delta: {}, finish_reason: null }]
+          };
+          res.write(`data: ${JSON.stringify(fakeChunk)}\n\n`);
           if (res.flush) res.flush();
         }
       }, 15000);
@@ -182,7 +180,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               res.write(`data: ${JSON.stringify(data)}\n\n`);
               if (res.flush) res.flush();
             } catch (e) {
-              // Falha silenciosa para pacotes incompletos
+              // Silencia erros de pacotes fatiados pela rede
             }
           }
         }
@@ -197,7 +195,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
       
       response.data.on('error', (err) => {
-        console.error('Erro no stream da NVIDIA:', err.message);
         if (!isDoneSent && !streamClosedByClient) {
           res.write('data: [DONE]\n\n');
           isDoneSent = true;
@@ -229,31 +226,40 @@ app.post('/v1/chat/completions', async (req, res) => {
     
   } catch (error) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
-
     if (axios.isCancel(error)) return; 
 
-    // Análise detalhada do erro retornado
-    let errorDetail = 'Erro de conexão upstream.';
+    let errorDetail = 'Erro desconhecido na API da NVIDIA.';
+    
+    // Tratamento robusto para extrair erros mesmo quando a resposta for um stream
     if (error.response) {
-      console.error('API da NVIDIA retornou erro:', error.response.status, JSON.stringify(error.response.data));
-      errorDetail = error.response.data?.detail || error.response.data?.message || `Erro HTTP ${error.response.status} da NVIDIA.`;
+      if (error.response.data && typeof error.response.data.on === 'function') {
+        try {
+          // Lê o stream de erro rejeitado
+          const chunks = [];
+          for await (const chunk of error.response.data) {
+            chunks.push(chunk);
+          }
+          const errorStr = Buffer.concat(chunks).toString('utf8');
+          const errorJson = JSON.parse(errorStr);
+          errorDetail = errorJson.detail || errorJson.message || `Erro HTTP ${error.response.status}`;
+        } catch (e) {
+          errorDetail = `Erro HTTP ${error.response.status} da NVIDIA.`;
+        }
+      } else {
+        errorDetail = error.response.data?.detail || error.response.data?.message || `Erro HTTP ${error.response.status}`;
+      }
     } else {
-      console.error('Falha de conexão no Proxy:', error.message);
       errorDetail = error.message;
     }
     
+    console.error('Falha processada no Proxy:', errorDetail);
+
     if (!res.headersSent) {
-      // Se os cabeçalhos ainda não foram enviados, retornamos o erro HTTP padrão
       res.status(error.response?.status || 502).json({
-        error: {
-          message: errorDetail,
-          type: 'proxy_error',
-          code: error.response?.status || 502
-        }
+        error: { message: errorDetail, type: 'proxy_error', code: error.response?.status || 502 }
       });
     } else if (!streamClosedByClient) {
-      // INJEÇÃO DE ERRO NO STREAM:
-      // Transforma o erro real em uma mensagem de chat para que o cliente exiba na tela
+      // Injeta o erro diretamente no chat para que você consiga ler no frontend
       const errorPayload = {
         id: `chatcmpl-error-${Date.now()}`,
         object: 'chat.completion.chunk',
@@ -261,11 +267,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         model: 'proxy-error-reporter',
         choices: [{
           index: 0,
-          delta: { content: `\n\n**[Erro no Servidor Proxy]** A comunicação com a NVIDIA falhou: ${errorDetail}\n\n` },
+          delta: { content: `\n\n⚠️ **[Falha no Proxy]:** ${errorDetail}\n\n` },
           finish_reason: 'stop'
         }]
       };
-      
       res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
@@ -274,14 +279,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.all('*', (req, res) => {
-  res.status(404).json({ error: { message: `Endpoint ${req.path} not found`, type: 'not_found', code: 404 } });
+  res.status(404).json({ error: { message: 'Not found' } });
 });
 
-process.on('uncaughtException', (err) => console.error('Falha Crítica (uncaughtException):', err));
-process.on('unhandledRejection', (reason) => console.error('Falha Crítica (unhandledRejection):', reason));
+process.on('uncaughtException', (err) => console.error('Erro Fatal:', err));
+process.on('unhandledRejection', (reason) => console.error('Rejeição Fatal:', reason));
 
 const server = app.listen(PORT, () => {
-  console.log(`Proxy rodando perfeitamente na porta ${PORT}`);
+  console.log(`Proxy Otimizado rodando na porta ${PORT}`);
 });
 
 server.keepAliveTimeout = 65000;
