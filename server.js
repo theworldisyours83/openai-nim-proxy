@@ -104,7 +104,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Connection': 'close'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 120000, // 2 minutos de tolerância máxima para a NVIDIA responder
+      timeout: 600000, // 2 minutos de tolerância máxima para a NVIDIA responder
       validateStatus: function (status) {
         return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
       }
@@ -248,3 +248,7 @@ app.listen(PORT, () => {
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
 });
+
+// Aumenta o tempo limite do servidor para evitar cortes em respostas longas
+server.keepAliveTimeout = 300000; // 5 minutos
+server.headersTimeout = 305000;   // 5 minutos + margem de segurança
