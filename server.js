@@ -242,7 +242,7 @@ app.all('*', (req, res) => {
 });
 
 // Inicialização do Servidor
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
