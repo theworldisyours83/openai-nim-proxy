@@ -121,6 +121,13 @@ const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest
       // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+const heartbeatId = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(': keep-alive\n\n');
+        }
+      }, 15000);
       
       let buffer = '';
       let reasoningStarted = false;
@@ -181,14 +188,19 @@ const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest
         });
       });
       
-      response.data.on('end', () => res.end());
+      response.data.on('end', () => {
+        clearInterval(heartbeatId); // Desliga o pulso
+        res.end();
+      });
+
       response.data.on('error', (err) => {
-  console.error('Stream interrompido:', err.message);
-  if (!res.writableEnded) {
-    res.end(); 
-  }
-});
-   } else {
+        clearInterval(heartbeatId); // Desliga o pulso em caso de falha externa
+        console.error('Stream interrompido:', err.message);
+        if (!res.writableEnded) {
+          res.end();
+        }
+      });
+      
       // Transform NIM response to OpenAI format with reasoning
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
