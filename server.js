@@ -113,102 +113,73 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (stream) {
       // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  let fullGeneratedText = '';
-  let isCompletedSuccessfully = false;
-
-  const consumeStream = async (requestPayload) => {
-    try {
-      const streamResponse = await axios.post(`${NIM_API_BASE}/chat/completions`, requestPayload, {
-        headers: {
-          'Authorization': `Bearer ${NIM_API_KEY}`,
-          'Content-Type': 'application/json',
-          'Connection': 'keep-alive'
-        },
-        responseType: 'stream',
-        timeout: 60000
-      });
-
-      let buffer = '';
-
-      return new Promise((resolve, reject) => {
-        streamResponse.data.on('data', (chunk) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          lines.forEach(line => {
-            if (line.startsWith('data: ')) {
-              if (line.includes('[DONE]')) {
-                return;
-              }
-
-              try {
-                const data = JSON.parse(line.slice(6));
-                const choice = data.choices?.[0];
-                
-                if (choice?.delta?.content) {
-                  fullGeneratedText += choice.delta.content;
-                }
-
-                if (choice?.finish_reason === 'stop' || choice?.finish_reason === 'length') {
-                  isCompletedSuccessfully = true;
-                }
-
-                res.write(`data: ${JSON.stringify(data)}\n\n`);
-              } catch (e) {}
-            }
-          });
-        });
-
-        streamResponse.data.on('end', () => {
-          resolve();
-        });
-
-        streamResponse.data.on('error', (err) => {
-          reject(err);
-        });
-      });
-
-    } catch (error) {
-      throw error;
-    }
-  };
-
-  try {
-    await consumeStream(nimRequest);
-  } catch (err) {
-    console.log('Stream interrompido prematuramente. Iniciando emenda transparente...');
-  }
-
-  let retries = 0;
-  while (!isCompletedSuccessfully && retries < 2 && fullGeneratedText.length > 0) {
-    retries++;
-    console.log(`[Proxy] Reconectando... Tentativa de emenda ${retries}/2`);
-
-    const patchedMessages = [...messages, { role: 'assistant', content: fullGeneratedText }];
-    
-    const retryRequest = {
-      ...nimRequest,
-      messages: patchedMessages
-    };
-
-    try {
-      await new Promise(r => setTimeout(r, 500));
-      await consumeStream(retryRequest);
-    } catch (retryErr) {
-      console.error(`Falha na emenda ${retries}:`, retryErr.message);
-      break;
-    }
-  }
-
-  res.write('data: [DONE]\n\n');
-  res.end();
-
-} else {
+      res.setHeader('Cache-Control', 'no-cache');
       
+      let buffer = '';
+      let reasoningStarted = false;
+      
+      response.data.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        lines.forEach(line => {
+          if (line.startsWith('data: ')) {
+            if (line.includes('[DONE]')) {
+              res.write(line + '\n');
+              return;
+            }
+            
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.choices?.[0]?.delta) {
+                const reasoning = data.choices[0].delta.reasoning_content;
+                const content = data.choices[0].delta.content;
+                
+                if (SHOW_REASONING) {
+                  let combinedContent = '';
+                  
+                  if (reasoning && !reasoningStarted) {
+                    combinedContent = '<think>\n' + reasoning;
+                    reasoningStarted = true;
+                  } else if (reasoning) {
+                    combinedContent = reasoning;
+                  }
+                  
+                  if (content && reasoningStarted) {
+                    combinedContent += '</think>\n\n' + content;
+                    reasoningStarted = false;
+                  } else if (content) {
+                    combinedContent += content;
+                  }
+                  
+                  if (combinedContent) {
+                    data.choices[0].delta.content = combinedContent;
+                    delete data.choices[0].delta.reasoning_content;
+                  }
+                } else {
+                  if (content) {
+                    data.choices[0].delta.content = content;
+                  } else {
+                    data.choices[0].delta.content = '';
+                  }
+                  delete data.choices[0].delta.reasoning_content;
+                }
+              }
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
+            } catch (e) {
+              res.write(line + '\n');
+            }
+          }
+        });
+      });
+      
+      response.data.on('end', () => res.end());
+      response.data.on('error', (err) => {
+        console.error('Stream error:', err);
+        res.end();
+      });
+   } else {
       // Transform NIM response to OpenAI format with reasoning
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
