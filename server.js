@@ -5,6 +5,11 @@ const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const http = require('http');
+const https = require('https');
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 // Middleware
 app.use(cors());
@@ -97,18 +102,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
     
     // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json',
-        'Connection': 'close'
-      },
-      responseType: stream ? 'stream' : 'json',
-      timeout: 600000, // 2 minutos de tolerância máxima para a NVIDIA responder
-      validateStatus: function (status) {
-        return status >= 200 && status < 300; // Só aceita sucesso, qualquer outra coisa vai direto para o catch
-      }
-    });
+const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+  headers: {
+    'Authorization': `Bearer ${NIM_API_KEY}`,
+    'Content-Type': 'application/json',
+    'Connection': 'keep-alive'
+  },
+  responseType: stream ? 'stream' : 'json',
+  httpAgent: httpAgent,
+  httpsAgent: httpsAgent,
+  timeout: 120000, // Tolerância de 2 minutos para evitar cortes prematuros
+  validateStatus: function (status) {
+    return status >= 200 && status < 300;
+  }
+});
     
     if (stream) {
       // Handle streaming response with reasoning
@@ -176,9 +183,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.end();
-      });
+  console.error('Stream interrompido:', err.message);
+  if (!res.writableEnded) {
+    res.end(); 
+  }
+});
    } else {
       // Transform NIM response to OpenAI format with reasoning
       const openaiResponse = {
